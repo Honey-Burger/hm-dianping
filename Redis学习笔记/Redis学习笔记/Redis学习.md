@@ -2438,3 +2438,131 @@ if (StrUtil.isBlank(token)) {
 | `token == null`     | ✅ true | ❌ false | ❌ false |
 
 `isBlank` 是最严格的，连纯空格也能拦住，避免无意义的 Redis 查询。
+
+
+
+
+
+#### 9、解决状态登录刷新的问题
+
+在上一节中我们实现了基于Redis实现短信登录，也写好了拦截器用于拦截未登录的请求，但又有一个问题出现：我们现在的拦截器，把获取token，查询是否存在用户，刷新token有效期，一节是否放行都写在一起了，关键是这个拦截器的拦截的只是**部分路径**，也就是说当用户登录状态一直访问白名单路径时，就会**产生用户实际在操作但是租期却没有一直刷新的问题**，这样租期一到就会直接强制下线。
+
+如何解决用户只要一操作就刷新token租期呢？首先想到的是把拦截路径改为全部，但是如果在`LoginInterceptor`的话的，就会出现用户不登录则无法访问任何页面的情况，这显然不是我们想要的。
+
+那么这里既然一个拦截器达不到要求，就直接分成两个拦截器，各司其职：
+
+![image-20260704160408913](Redis学习.assets/image-20260704160408913.png)
+
+第一个拦截器，拦截路径为所有路径，只负责刷新token，只要用户有操作就会刷新，但不论是不是登录状态（token是否过期）都放行；
+
+第二个拦截器专门检测token是否过期，如果过期就拦截。
+
+首先新增拦截器`com/hmdp/utils/RefreshTokenInterceptor.java`：
+
+```java
+package com.hmdp.utils;
+
+import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.core.util.StrUtil;
+import com.hmdp.dto.UserDTO;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.web.servlet.HandlerInterceptor;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+
+public class RefreshTokenInterceptor implements HandlerInterceptor {//拦截器，用于验证用户登录
+    private StringRedisTemplate stringRedisTemplate;
+    public RefreshTokenInterceptor(StringRedisTemplate stringRedisTemplate) {
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+    /***
+     * 这里的拦截器不起到拦截的作用
+     * 只是在用户有操作的时候进行刷新Token
+     * 不论用户是否登录，都给予放行
+     ***/
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+        // 1.获取请求头中的token
+        String token = request.getHeader("authorization");
+        if (StrUtil.isBlank(token)){//用于判断字符串是否为空
+            return true;
+        }
+        String key = RedisConstants.LOGIN_USER_KEY + token;
+        // 2.基于token获取Redis中的用户
+        Map<Object, Object> userMap = stringRedisTemplate.opsForHash().entries(key);
+        //3.判断用户是否存在
+        if (userMap.isEmpty()) {//4.不存在，直接放行
+            return true;
+        }
+        // 5.将查询到的Hash数据转化为UserDTO对象
+        UserDTO userDTO = BeanUtil.fillBeanWithMap(userMap, new UserDTO(), false);
+        // 6.存在，保存用户信息到TheadLocal
+        UserHolder.saveUser(userDTO);
+        // 7.刷新token有效期
+        stringRedisTemplate.expire(key, RedisConstants.LOGIN_USER_TTL, TimeUnit.MINUTES);
+        //8.放行
+        return true;
+    }
+}
+
+```
+
+然后修改拦截器`com/hmdp/utils/LoginInterceptor.java`：
+
+```java
+package com.hmdp.utils;
+
+import org.springframework.web.servlet.HandlerInterceptor;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+public class LoginInterceptor implements HandlerInterceptor {//拦截器，用于验证用户登录
+    /***
+     * 这里为第二个拦截器
+     * 拦截器只用于验证用户登录
+     ***/
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+        //1.判断是否需要拦截（ThreadLocal中是否有用户）
+        if (UserHolder.getUser() == null) {
+            //2.如果没有，则拦截
+            response.setStatus(401);
+            return false;
+        }
+        return true;
+    }
+}
+
+```
+
+这样就成功分开，达成要求。
+
+拦截器写好后，还要修改MvcConfig：
+
+```java
+@Configuration
+public class MvcConfig implements WebMvcConfigurer {
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        //1.登录拦截器（order为1后执行）
+        registry.addInterceptor(new LoginInterceptor())
+                .excludePathPatterns("/blog/hot", "/user/login", "/user/code","/shop/**","/voucher/**")
+                .order(1);//白名单，直接放行不拦截
+
+        //2.刷新拦截器（order为0先执行）
+        registry.addInterceptor(new RefreshTokenInterceptor(stringRedisTemplate)).addPathPatterns("/**").order(0);
+        //默认拦截所有路径,order为0是最高优先级
+    }
+}
+```
+
+将两个拦截器都注册进去，并且限制路径。其中`.order()`决定拦截器的执行顺序，0为最大，数字越大顺序越靠后。
+
+启动服务器，在前端多次刷新一下，然后去Redis数据库看token的租期有没有变，实际是要变的。
+
+这样刷新的问题就解决了。
