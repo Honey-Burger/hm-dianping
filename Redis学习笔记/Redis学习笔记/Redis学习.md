@@ -2566,3 +2566,158 @@ public class MvcConfig implements WebMvcConfigurer {
 启动服务器，在前端多次刷新一下，然后去Redis数据库看token的租期有没有变，实际是要变的。
 
 这样刷新的问题就解决了。
+
+
+
+
+
+
+
+------
+
+### 二、商户查询缓存
+
+#### 1、什么是缓存
+
+缓存就是数据交换的缓冲区（称作Cache），是存储数据的临时地方，一般读写性能比较高。
+
+**缓存的作用：**
+
+- 降低后端负载
+- 提高低些侠侣，降低响应时间
+
+**缓存的成本：**
+
+- 数据一致性成本
+- 代码维护成本
+- 运维成本
+
+
+
+#### 2、添加Redis缓存
+
+<img src="Redis学习.assets/image-20260705134536077.png" alt="image-20260705134536077" style="zoom:50%;" />
+
+根据id查询商铺缓存的流程
+
+```markdown
+┌────────────┐
+│    开始    │
+└──────┬─────┘
+       │
+┌───────────────┐
+│ 提交商铺id    │
+└──────┬────────┘
+       │
+┌──────────────────────┐
+│ 从Redis查询商铺缓存  │
+└──────┬───────────────┘
+       │
+┌──────────────────────┐
+│ 判断缓存是否命中     │
+└───┬───────────┬──────┘
+    │ 命中      │ 未命中
+    │           └───────────┐
+┌───────────────┐    ┌────────────────────┐
+│ 返回商铺信息  │    │ 根据id查询数据库   │
+└──────┬────────┘    └──────────┬───────────┘
+       │                        │
+       │                ┌────────────────────┐
+       │                │ 判断商铺是否存在   │
+       │                └───┬───────────┬────┘
+       │                    │ 存在       │ 不存在
+       │         ┌──────────┘           │
+       │  ┌──────────────────┐			|
+       │  ┤ 将商铺数据写入Redis │			|
+       │  └──────────┬───────┘			|
+       │             |        			|
+       └─────────────┘					|
+       │								|
+┌────────────┐    ┌────────────┐		|
+│   结束     │ ◄──┤  返回404     │───────┘
+└────────────┘    └────────────┘
+```
+
+照着这个流程，开始写代码。因为是从 Controller → Service 接口 → Service 实现一层层往下走，所以先改 Controller。
+
+**（1）Controller 层**
+
+打开 `ShopController.java`，原本的 `queryShopById` 直接调 MyBatis-Plus 的 `getById`：
+
+```java
+@GetMapping("/{id}")
+public Result queryShopById(@PathVariable("id") Long id) {
+    return Result.ok(shopService.getById(id));  // 查数据库，没走缓存
+}
+```
+
+改成调我们自己写的 `queryById`：
+
+```java
+@GetMapping("/{id}")
+public Result queryShopById(@PathVariable("id") Long id) {
+    return shopService.queryById(id);
+}
+```
+
+**（2）IShopService 接口**
+
+在 `IShopService.java` 里声明 `queryById` 方法：
+
+```java
+package com.hmdp.service;
+
+import com.hmdp.dto.Result;
+import com.hmdp.entity.Shop;
+import com.baomidou.mybatisplus.extension.service.IService;
+
+public interface IShopService extends IService<Shop> {
+
+    Result queryById(Long id);  // 新增：带缓存的商铺查询
+}
+```
+
+**（3）ShopServiceImpl 实现**
+
+在 `ShopServiceImpl.java` 里写具体逻辑，照着流程图一步步来：
+
+```java
+@Service
+public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Override
+    public Result queryById(Long id) {
+        String key = CACHE_SHOP_KEY + id;  // key 就是 "cache:shop:1" 这种
+        // 1.从Redis查询商铺缓存
+        String shopJson = stringRedisTemplate.opsForValue().get(key);
+
+        // 2.判断是否存在
+        if (StrUtil.isNotBlank(shopJson)) {
+            // 3.存在，直接返回
+            Shop shop = JSONUtil.toBean(shopJson, Shop.class);
+            return Result.ok(shop);
+        }
+        // 4.不存在，根据id查询数据库
+        Shop shop = getById(id);
+        // 5.数据库里不存在，返回错误
+        if (shop == null){
+            return Result.fail("店铺不存在!");
+        }
+        // 6.存在，写入Redis
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop));
+        // 7.返回
+        return Result.ok(shop);
+    }
+}
+```
+
+**几个关键点：**
+
+- `CACHE_SHOP_KEY` 是 `RedisConstants` 里的常量 `"cache:shop:"`，用 `import static` 导入，直接用不用写类名。
+- 商铺缓存用的是 **String 类型** 存 JSON，而不是 Hash。因为商铺数据是一整个对象，通常整体读写，不需要像用户信息那样单独改某个字段。
+- `StrUtil.isNotBlank(shopJson)` 是 Hutool 的工具方法，判断字符串非空——既不是 `null`，也不是空字符串，也不是纯空格。比 `shopJson != null` 更严谨。
+- `JSONUtil.toBean` 把 JSON 字符串转回 Java 对象，`JSONUtil.toJsonStr` 反过来把对象序列化为 JSON 字符串，都是 Hutool 提供的。
+
