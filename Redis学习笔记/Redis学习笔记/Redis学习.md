@@ -2935,3 +2935,77 @@ public Result updateShop(@RequestBody Shop shop) {
 - `CACHE_SHOP_TTL` 和 `TimeUnit.MINUTES`：给缓存加了过期时间，即使主动删除失败，缓存也会在 TTL 后自动失效，作为兜底。
 - `@Transactional`：保证数据库更新和缓存删除在同一个事务里，数据库出错则回滚。
 - 更新逻辑遵循 **Cache Aside**：先更新数据库 → 再删除缓存。缓存在下一次查询时重建。
+
+
+
+#### 5、缓存穿透的解决思路
+
+**缓存穿透**是指客户端请求在缓存中和数据库中都不存在，这样缓存永远不会失效，这些请求都会打到数据库上。
+
+常见的解决方案有两种：
+
+- 缓存空对象
+
+​	查询数据时先查 Redis，若缓存不存在则查询数据库，若数据库也无对应数据，就向 Redis 存入一个	带短 TTL 的空对象，后续请求再次查询该不存在的数据时，直接从缓存获取空结果，避免频繁查询数	据库，以此防止缓存穿透。
+
+​	优点：实现简单，维护方便
+
+​	缺点：额外的内存消耗，可能造成短期的不一致
+
+- 布隆过滤
+
+​	先把数据库里所有存在的id通过哈希计算存入布隆过滤器，查询时先通过过滤器判断：若判定不在，	直接返回不存在；若判定存在，再去查询缓存和数据库，以此拦截大量不存在的请求，避免缓存穿		透。
+
+​	优点：内存占用较少，没有多余key
+
+​	缺点：实现复杂，且存在误判可能
+
+
+
+#### 6、编码解决商铺查询的缓存穿透问题
+
+采用**缓存空对象**方案，在 `queryById` 方法里加上空值缓存逻辑：
+
+```java
+@Override
+public Result queryById(Long id) {
+    String key = CACHE_SHOP_KEY + id;
+    // 1.从Redis查询商铺缓存
+    String shopJson = stringRedisTemplate.opsForValue().get(key);
+    // 2.命中真实数据，返回
+    if (StrUtil.isNotBlank(shopJson)) {
+        Shop shop = JSONUtil.toBean(shopJson, Shop.class);
+        return Result.ok(shop);
+    }
+    // 3.命中空值（之前查过，确认数据库里也没有），直接返回不存在
+    if (shopJson != null) {
+        return Result.fail("店铺不存在!");
+    }
+    // 4.缓存未命中，查数据库
+    Shop shop = getById(id);
+    // 5.数据库也不存在 → 向Redis缓存空值，防止下次再穿透
+    if (shop == null) {
+        stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+        return Result.fail("店铺不存在!");
+    }
+    // 6.数据库存在，写入Redis
+    stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+    // 7.返回
+    return Result.ok(shop);
+}
+```
+
+**几个关键点：**
+
+- `StrUtil.isNotBlank(shopJson)` 和 `shopJson != null` 的区别：前者过滤了空字符串，后者没过滤。所以当缓存里存的是 `""`（空值标记），走第3步而非第2步，直接返回不存在，不用再查DB。
+- `CACHE_NULL_TTL = 2L`（2分钟）：空值缓存的过期时间比正常数据短得多，降低内存占用，同时也能较快恢复到一致状态（万一数据被补充了）。
+- `import static com.hmdp.utils.RedisConstants.*`：改为通配符导入，因为现在用到了多个常量（`CACHE_SHOP_KEY`、`CACHE_SHOP_TTL`、`CACHE_NULL_TTL`）。
+- 缓存穿透产生的原因是什么？
+  - 用户请求的数据在缓存中和数据库中都不存在，不断发起这样的请求，给数据库带来巨大压力 
+- 缓存穿透的解决方案有哪些？
+  - 缓存null值
+  - 布隆过滤
+  - 增强id的复杂度，避免被猜测id规律
+  - 做好数据的基础格式校验
+  - 加强用户权限校验
+  - 做好热点参数的限流
