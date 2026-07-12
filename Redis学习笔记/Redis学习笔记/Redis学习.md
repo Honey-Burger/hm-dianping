@@ -3009,3 +3009,219 @@ public Result queryById(Long id) {
   - 做好数据的基础格式校验
   - 加强用户权限校验
   - 做好热点参数的限流
+
+
+
+
+
+#### 7、缓存雪崩问题及其思路
+
+**缓存雪崩**是指在同一时间段大量的缓存key同时失效或者Redis服务宕机，导致大量数据库请求到达数据库，带来巨大压力。
+
+**解决方案：**
+
+- 给不同的key的TTL添加随机值
+- 利用Redis集群提高服务的可用性
+- 给缓存业务添加降级限流策略
+- 给业务添加多级缓存
+
+
+
+#### 8、缓存击穿问题及解决方案
+
+**缓存击穿问题**也叫热点问题，就是一个被**高并发访问**并且**缓存重建业务较为复杂**的key突然失效了，无数的请求访问会在瞬间给数据库带来极大的冲击。
+
+常见的解决方案有两种：
+
+- 互斥锁
+- 逻辑过期
+
+##### （1）互斥锁
+
+是解决缓存击穿的**同步**方案，当缓存失效时，通过加锁保证**同一时刻只有一个线程去数据库查询并重建缓存**，其他线程等待锁释放后重试读取缓存，能保证数据强一致性，但会造成请求阻塞，高并发下性能较差。
+
+<img src="Redis学习.assets/image-20260709151841639.png" alt="image-20260709151841639" style="zoom:50%;" />
+
+##### （2）逻辑过期
+
+是解决缓存击穿的**异步**方案，不设置 Redis 物理过期时间，而是在缓存数据中附带逻辑过期时间，查询时发现数据过期则立即返回旧值，同时开启独立线程异步更新缓存，性能极高且不会打垮数据库，但会存在短暂的数据不一致。
+
+<img src="Redis学习.assets/image-20260709152118220.png" alt="image-20260709152118220" style="zoom:50%;" />
+
+| 解决方案 | 优点                                                        | 缺点                                                       |
+| -------- | ----------------------------------------------------------- | ---------------------------------------------------------- |
+| 互斥锁   | （1）没有额外的内存消耗<br>（2）保证一致性<br>（3）实现简单 | （1）线程可能需要等待，性能受影响<br>（2）可能有死锁的风险 |
+| 逻辑过期 | 线程无需等待，性能较好                                      | （1）不保证一致性<br>（2）有额外内存消耗<br>（3）实现复杂  |
+
+
+
+#### 9、利用互斥锁解决缓存击穿问题
+
+需求：修改根据id查询商铺的业务，基于互斥锁方式来解决击穿问题
+
+<img src="Redis学习.assets/image-20260709164552227.png" alt="image-20260709164552227" style="zoom:67%;" />
+
+
+
+核心在于互斥锁的逻辑实现。
+
+在`com/hmdp/service/impl/ShopServiceImpl.java`中，我打算把互斥锁的逻辑实现单门封装成一个方法，然后在`queryById()`方法中调用。[待会缓存穿透的代码也打算单独封装，然后用来调用]
+
+创建方法`public Shop queryWithMutex(Long id)`
+
+1、先从从Redis查询商铺缓存:
+
+```java
+String key = CACHE_SHOP_KEY + id;
+        //1.从Redis查询商铺缓存
+        String shopJson = stringRedisTemplate.opsForValue().get(key);
+```
+
+2、判断其是否存在，判断命中的是否为空值：
+
+```java
+//2.判断是否存在
+        if (StrUtil.isNotBlank(shopJson)) {
+            //3.存在，直接返回
+            return JSONUtil.toBean(shopJson, Shop.class);
+        }
+		if (shopJson != null){//走到这里时，shopJson 只可能是 "" 或 null
+            return null;
+        }
+```
+
+如果是null，则判断为False，继续向下执行，如果为空字符串，则要变成null。总之都要变成null，才能启动缓存重建。
+
+3、缓存重建，实现互斥锁：
+
+```java
+//4.实现缓存重建
+        //4.1 实现互斥锁
+        String lockKey = "lock:shop:" + id;//定义锁的key
+        Shop shop = null;
+        try {
+            boolean isLock = tryLock(lockKey);
+            //4.2 判断是否获取成功
+            if (!isLock){
+                //4.3 失败，则休眠并重试
+                Thread.sleep(50);
+                return queryWithMutex(id);
+                //这里做了个递归，每次重试都从头走一遍逻辑（查缓存 → 抢锁），如果中途缓存已经重建好了，就提前命中缓存返回，不用非得自己抢到锁
+            }
+            //4.4 成功，根据id查询数据库
+            shop = getById(id);
+            //模拟重建的延时,用来测试互斥锁有没有产生作用
+            Thread.sleep(200);
+            //5.数据库里不存在，返回错误
+            if (shop == null){
+                //将空值写入Redis
+                stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+                return null;
+            }
+            //6.存在，写入Redis
+            stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop),CACHE_SHOP_TTL , TimeUnit.MINUTES);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            //7.释放互斥锁
+            unlock(lockKey);//不论线程有没有出现异常，只要持有锁到最后都要放锁
+        }
+
+        //8.返回
+        return shop;
+```
+
+这里首先是对锁进行一个key的定义，用来**在Redis中表明是谁的锁**。  调用`isLock()`，再判断当前线程有没有抢到锁，没有就休眠，然后进行下一轮**递归重试**，直到有结果，抢到了就进行缓存重建。
+
+重建缓存就要去数据库里面查这个数据到底在不在。如果在，就直接写入就行，如果不存在，就存一个空对象到缓存里，再返回null，这样即使没有这个数据，也能防止大量请求直接打在数据库上。
+
+最后就是在整个实现逻辑上进行异常处理，因为要保证**整个锁的实现正常与否，到最后都要保证锁能正常释放。**
+
+
+
+清空控制台日志，清空Redis缓存，打开**JMeter**，进行并发测试：
+
+先配置线程组，把线程数和执行时间设置好
+
+![image-20260712151207388](Redis学习.assets/image-20260712151207388.png)
+
+再配置请求地址，
+
+![image-20260712150834680](Redis学习.assets/image-20260712150834680.png)
+
+运行，进入IDEA控制台发现只有一条请求被打在了数据库上，其他全打在的Redis重建的缓存上面。这样这个缓存击穿就做好了。
+
+
+
+类似的思路，我们把前几节写的缓存穿透的逻辑实现也单门封装：
+
+```java
+public Shop queryWithPassThrough(Long id){//防止缓存穿透的Redis查询
+        String key = CACHE_SHOP_KEY + id;
+        //1.从Redis查询商铺缓存
+        String shopJson = stringRedisTemplate.opsForValue().get(key);
+
+        //2.判断是否存在
+        if (StrUtil.isNotBlank(shopJson)) {
+            //3.存在，直接返回
+            return JSONUtil.toBean(shopJson, Shop.class);
+        }
+        //判断命中是否为空值
+        if (shopJson != null){//走到这里时，shopJson 只可能是 "" 或 null
+            return null;
+        }
+        //4.不存在，根据id查询数据库
+        Shop shop = getById(id);
+        //5.数据库里不存在
+        if (shop == null){
+            //将空值写入Redis
+            stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+            return null;
+        }
+        //6.存在，写入Redis
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop),CACHE_SHOP_TTL , TimeUnit.MINUTES);
+        //7.返回
+        return shop;
+    }
+```
+
+用`queryById(Long id)`调用：
+
+```java
+@Override
+    public Result queryById(Long id) {
+        //缓存穿透
+        //Shop shop = queryWithPassThrough(id);
+
+        //互斥锁解决缓存击穿
+        Shop shop = queryWithMutex(id);
+        if (shop == null){
+            return Result.fail("店铺不存在！");
+        }
+        return Result.ok(shop);
+    }
+```
+
+
+
+##### 常见问题：
+
+- boolean类型的函数直接返回Boolean类型的数据会有什么结果？
+
+​		返回 `Boolean` 对象时：
+
+​		如果是 `Boolean.TRUE` / `FALSE`，会自动拆箱为 `boolean`，正常返回。
+
+​		如果是 null，拆箱时会触发 NullPointerException，直接报错。
+
+​		简单说：非空就正常，为 null就炸。
+
+- 为什么锁也要key
+
+​		锁的本质：一个**"共享标记"**
+​		锁本质上就是一个所有线程都能看到的标记。谁能把这个标记"抢到手"，谁就拥有锁。
+
+​		单机多线程（Java 的 synchronized / ReentrantLock）：标记存在 **JVM** 内存里，所有线程共享		同一个 **JVM**，所以能看见同一个标记。
+​		分布式系统（多台服务器）：每个服务器有自己的 JVM，内存不共享。如果锁只存在某一台机器		的 JVM 里，其他机器根本看不到 → 锁失效。
+​		Redis 就是那个**"所有机器都能看见的公共内存"**，把锁存在 Redis 里，所有服务都能访问到同一		把锁。
+
