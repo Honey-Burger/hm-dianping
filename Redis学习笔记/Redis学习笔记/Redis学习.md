@@ -3225,3 +3225,371 @@ public Shop queryWithPassThrough(Long id){//防止缓存穿透的Redis查询
 ​		分布式系统（多台服务器）：每个服务器有自己的 JVM，内存不共享。如果锁只存在某一台机器		的 JVM 里，其他机器根本看不到 → 锁失效。
 ​		Redis 就是那个**"所有机器都能看见的公共内存"**，把锁存在 Redis 里，所有服务都能访问到同一		把锁。
 
+
+
+
+
+#### 10、利用逻辑过期解决缓存击穿问题
+
+需求：修改根据id查询商铺的业务，基于逻辑过期方式来解决缓存击穿问题。
+
+![image-20260712204143986](Redis学习.assets/image-20260712204143986.png)
+
+逻辑过期的核心是判断Redis里的key的逻辑时间是否过期，所以每个被逻辑过期判断模块的对象都要有**逻辑时间**属性。
+
+但直接在业务实体 Shop 里添加逻辑时间属性显然不合适，因为 逻辑过期时间 不属于 Shop 这个业务概念，也就是说**店铺本身的业务属性里面没有页不应该有逻辑过期时间这个属性。**逻辑时间属于缓存细节。而且我们要保证逻辑时间的复用性要强，这个属性很有可能还会再别的业务实体中使用。
+
+所以最好的方法是，将其**单门包装成一个类**。在`com/hmdp/utils/`创建类RedisData：
+
+```java
+package com.hmdp.utils;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Data
+public class RedisData {
+    private LocalDateTime expireTime;//逻辑过期时间
+    private Object data;
+}
+```
+
+这里RedisData包含属性逻辑过期时间`expireTime`，还有实际的数据`data`,`data`的实际类型由实际的业务实体而决定，所以直接定义为`Object`类型，什么都能接收。
+
+这样我们到时候直接操作RedisData实体就可以了。
+
+
+
+接下来就是实现逻辑过期的具体细节：
+
+1、首先创建`public Shop queryWithLogicalExpire(Long id)`方法，
+
+2、提交商铺id并在Redis里面查询是否存在，
+
+```java
+		String key = CACHE_SHOP_KEY + id;
+        //1.从Redis查询商铺缓存
+        String shopJson = stringRedisTemplate.opsForValue().get(key);
+
+        //2.判断是否存在
+        if (StrUtil.isBlank(shopJson)) {
+            //3.不存在，直接返回null
+            return null;
+        }
+```
+
+3、如果命中了，则要先把从Redis取出来的json反序列化成对象，
+
+```java
+		//4.命中，需要先把json反序列化成对象
+        RedisData redisData = JSONUtil.toBean(shopJson, RedisData.class);
+        JSONObject data = (JSONObject) redisData.getData();
+        Shop shop = JSONUtil.toBean(data, Shop.class);
+        LocalDateTime expireTime = redisData.getExpireTime();
+        /*因为 data 声明为 Object，JSON 反序列化时解析器不知道具体目标类型，
+        就默认把它解析成通用的键值对容器 JSONObject（运行时类型）。
+        所以取出来后需要手动强转 + 再转一次才能得到真正的 Shop。
+        这正是之前讨论过的"为什么不用泛型"的延续——JSON 反序列化会丢失类型信息，
+        无论声明 Object 还是 <T>，取出来都得手动指定类型再转一次。*/
+```
+
+4、判断逻辑时间是否过期，未过期直接返回店铺信息，
+
+```java
+//5.判断是否过期
+        if (expireTime.isAfter(LocalDateTime.now())){
+            //5.1.未过期，直接返回店铺信息
+            return shop;
+        }
+```
+
+5、如果过期了，就要进行缓存重建
+
+```java
+		//6.缓存重建
+        //6.1.获取互斥锁
+        String lockKey = LOCK_SHOP_KEY + id;
+        boolean isLock = tryLock(lockKey);
+        //6.2.判断是否获锁成功
+        if (isLock){
+            //TODO 6.3.成功，开启独立线程，实现缓存重建
+            CACHE_REBUILD_EXECUTOR.submit(()->{
+                try {
+                    //重建缓存
+                    this.saveShop2Redis(id, 20L);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                } finally {
+                    //释放锁
+                    unlock(lockKey);
+                }
+            });
+        }
+        //6.4.返回过期的店铺信息
+        return shop;
+```
+
+首先是获取互斥锁，如果没抢所成功，就直接返回旧的店铺信息，
+
+抢到锁了，就开启独立线程。这里我们需要提前先创建一个线程池：
+
+```java
+private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);//线程池线程数量为10个
+
+```
+
+然后进行重建缓存，这里调用`saveShop2Redis(Long id,Long expireSeconds)`重建缓存，
+
+`saveShop2Redis(Long id,Long expireSeconds)`：
+
+```java
+public void saveShop2Redis(Long id,Long expireSeconds) throws InterruptedException {
+        //1.查询店铺数据
+        Shop shop = getById(id);
+        Thread.sleep(200);
+        //2.分装逻辑过期时间
+        RedisData redisData = new RedisData();
+        redisData.setData(shop);
+        redisData.setExpireTime(LocalDateTime.now().plusSeconds(expireSeconds));//从当前时间加上expireSeconds时间
+        //3.写入Redis
+        stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id,JSONUtil.toJsonStr(redisData));
+    }
+```
+
+需要注意的是，这里涉及了抢锁和释放锁，所以一定要用异常处理，保证不论什么情况下，锁都会被完全释放。
+
+重建完成后，返回新的店铺数据。
+
+
+
+##### 常见问题：
+
+- **我如果要用逻辑过期，就得添加一个逻辑过期时间，为什么不推荐直接在shop里面添加逻辑过期字段？**
+
+**不推荐直接在 `Shop` 里加 `expireTime`，是因为它是缓存层的技术细节，不属于业务实体。** 把它和业务模型混在一起，会污染实体、干扰数据库映射、泄露给前端，且无法复用。用独立的 `RedisData` 包装类，把"数据"和"缓存元信息"分开，才是干净的设计。
+
+本质上这是软件设计里一个很通用的原则：**区分"业务是什么"和"技术怎么实现"，让它们各司其职**。
+
+------
+
+
+
+- **@Resource是干嘛的？**
+
+`@Resource` 是 **JSR-250** 标准里的一个注解，作用是**依赖注入（DI）**——让 Spring 自动帮你把对象塞进字段里，不用自己 `new`。
+
+没有注解时，你得自己创建依赖对象：
+
+```java
+public class ShopServiceImpl {
+    private StringRedisTemplate stringRedisTemplate = new StringRedisTemplate(); // 自己new，配置麻烦
+}
+```
+
+用了 `@Resource`：
+
+```java
+public class ShopServiceImpl {
+    @Resource
+    private StringRedisTemplate stringRedisTemplate; // Spring自动注入，不用管怎么来的
+}
+```
+
+Spring 启动时看到 `@Resource`，会去容器里找 `StringRedisTemplate` 这个 Bean，自动赋值给这个字段。
+
+​	**注入规则（重要）：**
+
+`@Resource` 注入时**默认按名称找，找不到再按类型找**：
+
+1. 先看字段名（比如 `stringRedisTemplate`），去容器里找有没有叫这个名字的 Bean
+2. 找不到 → 退而按**类型**（`StringRedisTemplate`）找
+3. 还找不到 → 报错
+
+和 `@Autowired` 的区别
+
+这是面试常考点，也最容易混：
+
+| 对比项            | `@Resource`                  | `@Autowired`                 |
+| ----------------- | ---------------------------- | ---------------------------- |
+| 来源              | JSR-250 标准（JDK 自带规范） | Spring 自带                  |
+| 默认匹配方式      | **先按名称**，再按类型       | **先按类型**                 |
+| 配合 `@Qualifier` | 自带 `name` 属性，可指定名称 | 需配合 `@Qualifier` 指定名称 |
+| 适用范围          | 字段、setter                 | 字段、setter、**构造方法**   |
+
+------
+
+
+
+- **逻辑 过期未命中为何直接返回null？**
+
+**逻辑过期方案根本不查数据库，它依赖"缓存永远存在"这个前提。**
+
+先看逻辑过期方案的完整流程：
+
+```
+1. 查 Redis
+2. 缓存未命中 (key不存在) ──► 直接返回 null   ← 你问的这步
+3. 缓存命中 ──► 判断逻辑过期时间
+   ├─ 未过期 ──► 返回数据
+   └─ 已过期 ──► 尝试抢锁
+        ├─ 抢到锁 ──► 开新线程重建缓存 + 释放锁 + 返回旧数据
+        └─ 没抢到 ──► 返回旧数据
+```
+
+注意：**整个流程里没有任何一步去查数据库**。这就是**逻辑过期方案和互斥锁方案最大的区别。**
+
+✅ 未命中 = 异常情况，应该报警而非查库
+
+在逻辑过期方案的设计里，"缓存未命中"本身就是一种**不正常的状态**，可能的原因：
+
+- 预热没做好（漏了这个 key）
+- Redis 故障 / 重启后数据丢了
+- 有人误删了缓存
+
+正确做法不是去查库兜底，而是：
+- 返回 null（或一个降级提示）
+- 触发告警，让人去排查 / 重新预热
+
+用查数据库来"兜底"反而掩盖了问题。
+
+三种方案对比：
+
+| 方案         | 缓存未命中时        | 是否查数据库            | 目标           |
+| ------------ | ------------------- | ----------------------- | -------------- |
+| 普通缓存     | 查数据库            | ✅ 会                    | 简单可用       |
+| 互斥锁       | 抢锁 → 查数据库重建 | ✅ 会（但只让1个线程查） | 防击穿，强一致 |
+| **逻辑过期** | **直接返回 null**   | ❌ **完全不查**          | 防击穿，高可用 |
+
+------
+
+
+
+- **`JSONObject data = (JSONObject) redisData.getData();`我定义的`data`类型为`Object`，为什么这里是`JSONObject`呢？**
+
+这是 JSON 反序列化时一个很关键的细节，这里详细解释。
+
+**关键原因：反序列化时，Spring/Jackson 不知道 `Object` 到底是什么类型**
+
+`data` 字段声明为 `Object`，对 JSON 解析器来说就是个"黑盒"——它不知道你原本塞进去的是 `Shop`、`Voucher` 还是别的。
+
+存进 Redis 时，JSON 长这样：
+
+```json
+{
+  "expireTime": "2026-07-12T20:00:00",
+  "data": {
+    "id": 1,
+    "name": "茶颜悦色",
+    "typeId": 10,
+    ...
+  }
+}
+```
+
+取出来反序列化时：
+
+```java
+RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+```
+
+所以 `redisData.getData()` 返回的对象，**运行时类型是 `JSONObject`**，只是它的**编译时声明类型是 `Object`**。
+
+编译时类型 vs 运行时类型（核心概念）：
+
+|                        | 类型         | 说明                               |
+| ---------------------- | ------------ | ---------------------------------- |
+| **声明类型**（编译时） | `Object`     | 字段定义时写的类型，编译器只认这个 |
+| **实际类型**（运行时） | `JSONObject` | 对象真正是什么类，运行时才知道     |
+
+```java
+Object data = redisData.getData();
+//     ↑ 声明类型          ↑ 实际返回的是 JSONObject 实例
+```
+
+所以强转是合法的，因为运行时它**真的就是** `JSONObject`：
+
+```java
+JSONObject data = (JSONObject) redisData.getData();  // ✅ 没问题
+```
+
+怎么拿到真正的 `Shop`？
+
+需要**再手动转一次**，把 `JSONObject` 转成 `Shop`：
+
+```java
+JSONObject data = (JSONObject) redisData.getData();
+Shop shop = JSONUtil.toBean(data, Shop.class);  // JSONObject → Shop
+```
+
+或者一步到位（课程里常见的写法）：
+
+```java
+Shop shop = JSONUtil.toBean(
+    JSONUtil.toJsonStr(redisData.getData()),  // 把Object重新转回JSON字符串
+    Shop.class
+);
+```
+
+------
+
+
+
+- **缓存重建需要单独线程，为什么要提前建立线程池？**
+
+很多人会图省事直接写：
+
+```java
+new Thread(() -> 重建缓存).start();  // ❌ 不推荐
+```
+
+但课程/工程里推荐**提前定义好一个线程池**：
+
+```java
+// 提前建好的线程池（成员变量）
+private static final ExecutorService CACHE_REBUILD_EXECUTOR =
+    Executors.newFixedThreadPool(10);
+```
+
+原因有这几点：
+
+1. 🔴 `new Thread` 每次都创建新线程，开销大
+
+- 线程创建/销毁要**操作系统介入**，涉及内核态切换、分配栈空间（默认 1MB），是个重活
+- 高并发下每次重建都 `new Thread`，频繁创建销毁，浪费 CPU 和内存线程池**复用线程**：建好后线程常驻，有任务就丢给空闲线程执行，省去反复创建销毁的开销。
+
+2. 🔴 `new Thread` 无法控制数量，可能拖垮系统
+
+逻辑过期方案的特点是：缓存一过期，**可能瞬间涌入大量请求**都发现过期（虽然只有1个能抢到锁重建，但抢锁失败的那批也来过）。
+
+设想极端情况：如果每次重建都 `new Thread`，一旦出现缓存雪崩（大量 key 同时过期），可能瞬间创建出**成百上千个线程**：
+
+- 每个线程占 1MB 栈 → 内存爆掉 `OutOfMemoryError`
+- 大量线程抢 CPU → 上下文切换开销巨大，系统反而更慢
+- 还可能把数据库连接池打爆（每个线程都要查库）
+
+线程池**有上限**（比如 `newFixedThreadPool(10)` 最多 10 个线程），超出任务进队列排队，**给系统装了限流阀**，防止失控。
+
+3. 🔴 `new Thread` 不利于管理
+
+线程池提供统一的管理能力：
+- **优雅关闭**：应用停止时，线程池能等待任务执行完再退出，避免任务丢失
+- **监控**：可以查队列长度、活跃线程数等指标
+- **拒绝策略**：任务太多时怎么处理（丢弃、报错、调用者自己执行……）
+
+`new Thread()` 创建的线程是"野线程"，不受控、无法管理、出了问题难排查。
+
+4. ✅ 提前建好 = 启动时初始化，避免运行时延迟
+
+如果线程池是**用到时才建**（懒加载），第一个触发重建的请求要承受"建线程池"的额外耗时。提前在类加载时（`static final`）建好，运行时直接用，**零初始化延迟**。
+
+三、对比总结
+
+|              | `new Thread()`         | 线程池（提前建好）     |
+| ------------ | ---------------------- | ---------------------- |
+| 线程创建开销 | 每次都创建销毁，开销大 | 复用，开销小           |
+| 数量控制     | ❌ 无限创建，可能 OOM   | ✅ 有上限，带限流       |
+| 任务管理     | ❌ 无法管理             | ✅ 队列、拒绝策略、监控 |
+| 优雅关闭     | ❌ 做不到               | ✅ 可以等待任务完成     |
+| 适用场景     | 几乎不推荐             | 工程标准做法           |
+
+
+
