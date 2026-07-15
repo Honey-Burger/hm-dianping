@@ -2940,7 +2940,7 @@ public Result updateShop(@RequestBody Shop shop) {
 
 #### 5、缓存穿透的解决思路
 
-**缓存穿透**是指客户端请求在缓存中和数据库中都不存在，这样缓存永远不会失效，这些请求都会打到数据库上。
+**缓存穿透**是指客户端请求在缓存中和数据库中都不存在，这样缓存永远不会生效，这些请求都会打到数据库上。
 
 常见的解决方案有两种：
 
@@ -3593,3 +3593,384 @@ private static final ExecutorService CACHE_REBUILD_EXECUTOR =
 
 
 
+
+
+#### 11、封装Redis工具类
+
+基于StringRedisTemplate封装一个缓存工具类，满足下列需求：
+
+- 方法一：将任意Java对象序列化为json并存储在string类型的key中，并且可以设置TTL过期时间
+- 方法二：将任意Java对象序列化为json并存储在string类型的key中，并且可以设置逻辑过期时间，用于处理缓存击穿问题
+- 方法三：根据指定的key查询缓存，并反序列化为指定类型，利用缓存空值的方式就解决缓存穿透问题
+- 方法四：根据指定的key查询缓存，并反序列化为指定类型，需要利用逻辑过期解决缓存击穿问题
+
+前面几节里，缓存穿透、互斥锁、逻辑过期这些逻辑全都堆在 `ShopServiceImpl` 里，而且写死了 `Shop` 类型。
+
+问题是：这些逻辑其实和"商铺"没有半毛钱关系，换一个业务（比如优惠券查询）又得把同样的代码抄一遍。所以这一节的目标就是把这些缓存套路**抽成一个通用工具类 `CacheClient`**，用泛型让"存什么类型、用什么id查"都由调用方决定，做到一次封装、处处复用。
+
+在 `com/hmdp/utils/CacheClient.java` 中创建工具类：
+
+```java
+@Slf4j
+@Component  // 由Spring维护，交给Spring容器，别处直接 @Resource 注入即可
+public class CacheClient {
+
+    private final StringRedisTemplate stringRedisTemplate;
+
+    public CacheClient(StringRedisTemplate stringRedisTemplate){
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+    // ... 四个方法 + tryLock/unlock
+}
+```
+
+几个关键点：
+
+- **`@Component`**：让 `CacheClient` 成为 Spring Bean，这样 `ShopServiceImpl` 里 `@Resource private CacheClient cacheClient;` 就能直接注入，不用自己 `new`。
+- **构造方法注入 `StringRedisTemplate`**：工具类内部要操作 Redis，得拿到 `StringRedisTemplate`。用构造方法注入（而不是 `@Resource` 字段注入）是因为 `StringRedisTemplate` 是 final 字段，能在对象创建时就赋值，更稳妥，也方便单测。因为是 Spring Bean，Spring 会自动帮我们把 `StringRedisTemplate` 传进构造方法。
+
+---
+
+##### （1）方法一：set —— 带TTL的普通缓存
+
+```java
+public void set(String key, Object value, Long time, TimeUnit unit){
+    // TTL过期
+    stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(value), time, unit);
+}
+```
+
+最基础的方法：把任意 Java 对象序列化成 JSON，存进 String 类型的 key，并设置 TTL 过期时间。`value` 声明为 `Object`，所以传 `Shop`、`Voucher`、`User` 都行，内部统一用 `JSONUtil.toJsonStr` 序列化。
+
+---
+
+##### （2）方法二：setWithLogicalExpire —— 带逻辑过期的缓存
+
+```java
+public void setWithLogicalExpire(String key, Object value, Long time, TimeUnit unit){
+    // 逻辑过期
+    RedisData redisData = new RedisData();
+    redisData.setData(value);  // 把值塞进redisData，这样就有逻辑过期时间属性
+    redisData.setExpireTime(LocalDateTime.now().plusSeconds(unit.toSeconds(time)));
+    // 写入Redis
+    stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
+}
+```
+
+逻辑过期方案的关键在于：**Redis 里这个 key 永远不设物理 TTL**，而是把"逻辑过期时间"塞进 `RedisData` 一起存进去。查询时由业务代码自己判断 `expireTime` 是否过期。
+
+注意这里和 `ShopServiceImpl` 里 `saveShop2Redis` 的区别——之前是先 `getById` 查库再封装，这里**只负责封装和写入**，数据由调用方传进来（`value` 参数），查询数据库的职责交给了方法四里的 `dbFallback`。这样工具类就更纯粹，不绑定具体的数据库查询逻辑。
+
+`unit.toSeconds(time)` 把"时间 + 单位"统一换算成秒，再 `plusSeconds` 加到当前时间上，得到逻辑过期时间点。
+
+---
+
+##### （3）方法三：queryWithPassThrough —— 泛型 + 缓存空值防穿透
+
+```java
+public <R, ID> R queryWithPassThrough(
+        String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit
+){
+    String key = keyPrefix + id;
+    // 1.从Redis查询缓存
+    String json = stringRedisTemplate.opsForValue().get(key);
+
+    // 2.判断是否存在
+    if (StrUtil.isNotBlank(json)) {
+        // 3.存在，直接返回
+        return JSONUtil.toBean(json, type);
+    }
+    // 命中是否为空值
+    if (json != null) {  // 走到这里时，json 只可能是 "" 或 null
+        return null;
+    }
+    // 4.不存在，根据id查询数据库
+    R r = dbFallback.apply(id);
+    // 5.数据库里不存在
+    if (r == null){
+        // 将空值写入Redis
+        stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+        return null;
+    }
+    // 6.存在，写入Redis
+    this.set(key, r, time, unit);
+    // 7.返回
+    return r;
+}
+```
+
+逻辑和第6节写的 `queryWithPassThrough` 完全一样（命中返回、命中空值返回null、未命中查库、查不到缓存空值、查到写缓存），区别只在于**用泛型把 `Shop` 换成了 `R`、`Long` 换成了 `ID`**，让它不再绑定商铺。
+
+几个参数的含义：
+
+| 参数 | 含义 | 例子 |
+| --- | --- | --- |
+| `keyPrefix` | key 的前缀，和 id 拼成完整 key | `"cache:shop:"` |
+| `id` | 查询的业务id，类型由 `ID` 决定 | `1L` |
+| `type` | 反序列化的目标类型，告诉 `JSONUtil.toBean` 转成什么 | `Shop.class` |
+| `dbFallback` | 缓存未命中时"怎么查数据库"的回调函数 | `this::getById` |
+| `time` / `unit` | 缓存 TTL | `30L` / `MINUTES` |
+
+- **`<R, ID>` 泛型**：`R` 是返回值类型（如 `Shop`），`ID` 是 id 类型（如 `Long`）。声明在返回值前，整个方法就都能用这两个类型变量了。
+- **`Function<ID, R> dbFallback`**：`Function` 是一个函数式接口，接收 `ID`、返回 `R`。它把"查数据库"这一步**外包给调用方**——工具类不知道你要查哪张表，调用方传一个 `this::getById` 进来，工具类在缓存未命中时调 `dbFallback.apply(id)` 去查库。这就是为什么工具类能通用：查询逻辑由调用方决定，工具类只负责"缓存套路"。
+- **`type` 为什么必须传**：因为 JSON 反序列化会丢失类型信息（前面第10节讲过 `data` 声明为 `Object` 取出来变成 `JSONObject` 的问题），`JSONUtil.toBean(json, type)` 必须明确告诉它转成 `Shop` 还是别的，所以目标类型得由调用方传进来。
+- **复用 `this.set`**：写缓存那一步直接调方法一，避免重复代码。
+
+---
+
+##### （4）方法四：queryWithLogicalExpire —— 泛型 + 逻辑过期防击穿
+
+```java
+private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
+// 固定10个线程的线程池，专门用来异步重建缓存
+
+public <R, ID> R queryWithLogicalExpire(
+        String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit
+){
+    String key = keyPrefix + id;
+    // 1.从Redis查询缓存
+    String json = stringRedisTemplate.opsForValue().get(key);
+
+    // 2.判断是否存在
+    if (StrUtil.isBlank(json)) {
+        // 3.不存在，直接返回null（逻辑过期方案不查库，依赖"缓存永远存在"的前提）
+        return null;
+    }
+    // 4.命中，先把json反序列化成对象
+    RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+    JSONObject data = (JSONObject) redisData.getData();
+    R r = JSONUtil.toBean(data, type);
+    LocalDateTime expireTime = redisData.getExpireTime();
+    // data 声明为 Object，反序列化时被解析成 JSONObject，所以要强转 + 再转一次才能拿到真正的 R
+
+    // 5.判断是否过期
+    if (expireTime.isAfter(LocalDateTime.now())){
+        // 5.1.未过期，直接返回
+        return r;
+    }
+
+    // 5.2.已过期，需要缓存重建
+    // 6.1.获取互斥锁
+    String lockKey = LOCK_SHOP_KEY + id;
+    boolean isLock = tryLock(lockKey);
+    // 6.2.判断是否获锁成功
+    if (isLock){
+        // 6.3.成功，开启独立线程，实现缓存重建
+        CACHE_REBUILD_EXECUTOR.submit(() -> {
+            try {
+                // 查询数据库
+                R r1 = dbFallback.apply(id);
+                // 写入Redis并且加入逻辑过期时间
+                this.setWithLogicalExpire(key, r1, time, unit);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            } finally {
+                // 释放锁
+                unlock(lockKey);
+            }
+        });
+    }
+    // 6.4.返回旧数据（不管有没有抢到锁，都先返回过期的旧数据，不让用户等）
+    return r;
+}
+```
+
+逻辑和第10节写的 `queryWithLogicalExpire` 完全一致（未命中返回null、命中判断逻辑过期、未过期返回、过期抢锁异步重建、抢到锁开线程重建并释放锁、返回旧数据），区别同样是**泛型化**：`Shop` → `R`，`saveShop2Redis(id, 20L)` 换成了 `this.setWithLogicalExpire(key, r1, time, unit)`——重建时不再自己查库+封装，而是调 `dbFallback.apply(id)` 拿到新数据，再交给方法二写入。
+
+注意 `LOCK_SHOP_KEY`（`"lock:shop:"`）这里直接用作锁 key 前缀了，虽然是工具类，但锁的前缀还是写死了 `lock:shop:`。严格来说工具类应该把锁前缀也作为参数传进来，但目前业务场景够用，没做那么彻底的解耦。
+
+---
+
+##### （5）tryLock / unlock —— 互斥锁的底层封装
+
+```java
+private boolean tryLock(String key){  // 上互斥锁，key是锁的key
+    Boolean aBoolean = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.SECONDS);  // 相当于SETNX
+    return BooleanUtil.isTrue(aBoolean);  // 不直接返回，因为Boolean对象可能为null
+}
+
+private void unlock(String key){  // 释放互斥锁
+    stringRedisTemplate.delete(key);
+}
+```
+
+和之前 `ShopServiceImpl` 里的一模一样，只是搬进了工具类。`setIfAbsent` 就是 Redis 的 `SETNX`（key不存在才设置），加上10秒过期作为兜底，防止拿到锁的线程挂了导致锁永远不释放（死锁）。`BooleanUtil.isTrue(aBoolean)` 把可能为 null 的 `Boolean` 安全拆箱成 `boolean`。
+
+这两个方法设为 `private`，因为它们是工具类内部用的，不对外暴露。
+
+---
+
+##### （6）ShopServiceImpl 改用工具类
+
+工具类封装好后，`ShopServiceImpl` 里那些 `queryWithPassThrough`、`queryWithLogicalExpire`、`tryLock`、`unlock`、`saveShop2Redis` 全都不用自己写了，直接调 `cacheClient` 的方法即可（旧代码注释保留作对照）：
+
+```java
+@Resource
+private CacheClient cacheClient;
+
+@Override
+public Result queryById(Long id) {
+    // 解决缓存穿透
+    // Shop shop = cacheClient.queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+
+    // 逻辑过期解决缓存击穿
+    Shop shop = cacheClient.queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+
+    if (shop == null){
+        return Result.fail("店铺不存在！");
+    }
+    return Result.ok(shop);
+}
+```
+
+调用时一眼就能看出泛型参数是怎么落地的：`R = Shop`、`ID = Long`、`type = Shop.class`、`dbFallback = this::getById`（把 Service 自己的 `getById` 当作查库回调传进去）。
+
+> ⚠️ **注意**：逻辑过期方案依赖"缓存已预热、永远存在"这个前提，所以 `queryById` 切到 `queryWithLogicalExpire` 之前，**必须先把商铺数据用 `setWithLogicalExpire` 提前写进 Redis**，否则缓存未命中会直接返回 null（详见第10节常见问题"逻辑过期未命中为何直接返回null"）。预热在下面的测试里做。
+
+---
+
+##### （7）测试：预热商铺缓存
+
+逻辑过期方案要先用带逻辑过期时间的方式把数据灌进 Redis。在 `HmDianPingApplicationTests` 里加测试方法：
+
+```java
+@Resource
+private ShopServiceImpl shopService;
+@Resource
+private CacheClient cacheClient;
+
+@Test
+void TestSaveShop() throws InterruptedException {
+    Shop shop = shopService.getById(1L);
+    cacheClient.setWithLogicalExpire(CACHE_SHOP_KEY + 1L, shop, 10L, TimeUnit.SECONDS);
+}
+```
+
+先把1号商铺从数据库查出来，再用 `cacheClient.setWithLogicalExpire` 写进 Redis，逻辑过期时间设为10秒。这样跑完测试后 Redis 里就有这条带逻辑过期时间的缓存了，`queryWithLogicalExpire` 就能正常命中。
+
+> 💡 这里10秒只是测试方便观察过期和重建，生产环境逻辑过期时间会设得长得多（比如几小时）。
+
+---
+
+##### （8）小结：工具类封装的意义
+
+把缓存套路抽成 `CacheClient` 之后：
+
+1. **复用**：任何业务的查询缓存都能套用，新增一个优惠券查询只要 `cacheClient.queryWithPassThrough("cache:voucher:", id, Voucher.class, this::getById, ...)` 一行，不用再抄一遍穿透逻辑。
+2. **职责分离**：`ShopServiceImpl` 只关心"商铺业务"（查库用 `getById`、key前缀用 `CACHE_SHOP_KEY`），缓存套路（穿透、击穿、序列化、锁）全归 `CacheClient`，业务代码一下子清爽了。
+3. **泛型解耦**：`<R, ID>` + `Function<ID, R> dbFallback` 把"缓存套路"和"查什么数据"彻底分开——工具类不知道也不关心你查的是商铺还是别的，调用方通过传 `type` 和 `dbFallback` 把这两件事补齐。
+
+| 方法 | 作用 | 对应的缓存问题 |
+| --- | --- | --- |
+| `set` | 存对象 + TTL | 普通缓存 + 超时剔除 |
+| `setWithLogicalExpire` | 存对象 + 逻辑过期时间 | 逻辑过期方案的预热 |
+| `queryWithPassThrough` | 查缓存 + 缓存空值 | 缓存穿透 |
+| `queryWithLogicalExpire` | 查缓存 + 异步重建 | 缓存击穿（逻辑过期） |
+
+至此，商铺查询缓存这块就把"穿透、雪崩、击穿"三种问题的解决方案全部封装成了可复用工具。
+
+
+
+**常见问题：**
+
+- **在CacheClient类中，封装queryWithPassThrough方法为什么要用泛型？**
+
+因为 `CacheClient` 是一个通用工具类，要给所有业务复用，不能写死成 Shop。
+
+重点讲两个参数
+1. `Class<R> type` —— 为什么要把 Class 传进来？
+因为泛型擦除。Java 泛型只存在于编译期，运行时 R 的类型信息会被擦除，`JSONUtil.toBean(json, R.class)` 这种写法是编译不过的（R.class 非法）。
+
+​		所以必须由调用方显式把 Class 对象传进来：`	JSONUtil.toBean(json, type);   // type = Shop.class`，运行时能拿到。
+
+​	这是 Java 泛型 + JSON 反序列化的标准套路。
+
+2. `Function<ID, R> dbFallback` —— 为什么要传一个函数？
+CacheClient 是工具类，它不知道你要查哪个表（Shop？Voucher？）。但"缓存未命中查数据库"这一步又是必需的。
+
+
+
+- **我作为工具类开发者，我怎么知道dbFallback有apply方法？**
+
+**因为 `Function` 是 JDK 自带的标准接口，它的契约就是规定有 `apply` 方法**。
+
+它的**契约**就是：「接收一个参数 T，返回一个结果 R，核心方法是 `apply`」。
+
+JDK 里有一整套这样的标准接口，都遵循"一个抽象方法代表功能"的契约，记住几个常用的就够：一句话：**接口是契约，`apply` 是 `Function` 契约里规定的方法，查文档或 IDE 就能看到；你按契约调用，实现交给调用方。** 🔌
+
+
+
+- **`public <R, ID> R queryWithPassThrough`类是<R, ID>，参数`Function<ID, R>`，顺序不一样有什么说法吗？Function的<ID, R>有都是什么意思？**
+
+**有！而且必须不一样。**
+
+1. `<R, ID>` 是「声明」类型参数（你随便定顺序）
+
+方法上的 `<R, ID>` 是在**声明**："我这个方法有两个类型参数，分别叫 R 和 ID"。
+
+
+
+2. `Function<ID, R>` 是「使用」类型参数（顺序被 JDK 锁死）
+
+`Function<ID, R>` 是在**使用**你声明的类型参数，去填充 JDK 的 `Function<T, R>` 接口。
+
+而 `Function<T, R>` 是 **JDK 定义好的**，它的两个参数有**固定含义和顺序**：
+
+```java
+// JDK 源码定义
+public interface Function<T, R> {   // ← T在前，R在后，JDK规定的
+    R apply(T t);                    // T是输入，R是返回
+}
+```
+
+- **第一个参数 `T`** = 输入类型（apply 的参数类型）
+- **第二个参数 `R`** = 返回类型（apply 的返回类型）
+
+## 问题二：`Function<ID, R>` 的 `<ID, R>` 各是什么意思？
+
+对照 JDK 的定义 `Function<T, R>`（T=输入, R=返回）：
+
+| 位置  | 你的类型 | 对应JDK的   | 含义                                               |
+| ----- | -------- | ----------- | -------------------------------------------------- |
+| 第1个 | `ID`     | `T`（输入） | `apply` 方法的**参数类型**——查库时传入的主键类型   |
+| 第2个 | `R`      | `R`（返回） | `apply` 方法的**返回类型**——查库返回的业务对象类型 |
+
+意思是：**传入一个 ID，返回一个 R**。
+
+
+
+- **`this::getById`这种写法是什么写法，和lambda表达式的区别？**
+
+`this::getById` 这种写法叫**方法引用（Method Reference）**，它是 lambda 表达式的一种**简写形式**。我来详细讲。
+
+意思是：**「指向某个已经存在的方法，把它当作函数式接口的实现来用」**。
+
+`this::getById` 就是：「把当前对象 `this` 的 `getById` 方法，拿来当作 `Function` 的实现」。
+
+当一个 lambda 表达式**仅仅是调用一个已存在的方法**、什么额外的事都不做时，就可以用方法引用简写。
+
+两者**完全等价**：
+
+```java
+// lambda 写法
+id2 -> shopService.getById(id2)
+
+// 方法引用写法（前提：lambda 体只是单纯调用一个方法）
+shopService::getById
+```
+
+注意看：lambda 写法里 `id2 -> shopService.getById(id2)`，参数 `id2` 只是原封不动地传给了 `getById`，没干别的。这种"纯转发"的场景就能用方法引用简写，省掉重复的参数。
+
+`this::getById` 同理，等价于：
+
+```java
+id2 -> this.getById(id2)
+```
+
+
+
+- **那`this::getById`参数怎么穿进去的呢？**
+
+核心认知：方法引用只是"指向方法"，不执行
+
+`this::getById` 这一行代码，**仅仅是创建了一个函数对象**，并没有执行 `getById`，也没有传参。

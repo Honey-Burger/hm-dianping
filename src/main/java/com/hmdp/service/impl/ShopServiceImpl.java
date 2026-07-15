@@ -9,6 +9,7 @@ import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisData;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -37,23 +38,28 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
+    @Resource
+    private CacheClient cacheClient;
+
     @Override
     public Result queryById(Long id) {
         //解决缓存穿透
-        //Shop shop = queryWithPassThrough(id);
+        /*Shop shop = cacheClient.
+                queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);*/
 
         //互斥锁解决缓存击穿
-        //Shop shop = queryWithMutex(id);
+        Shop shop = cacheClient.
+                queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
 
         //逻辑过期解决缓存击穿
-        Shop shop = queryWithLogicalExpire(id);
+        //Shop shop = queryWithLogicalExpire(id);
         if (shop == null){
             return Result.fail("店铺不存在！");
         }
         return Result.ok(shop);
     }
 
-    public Shop queryWithMutex(Long id){//互斥锁防止缓存击穿的实现
+/*    public Shop queryWithMutex(Long id){//互斥锁防止缓存击穿的实现
         String key = CACHE_SHOP_KEY + id;
         //1.从Redis查询商铺缓存
         String shopJson = stringRedisTemplate.opsForValue().get(key);
@@ -124,11 +130,11 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         JSONObject data = (JSONObject) redisData.getData();
         Shop shop = JSONUtil.toBean(data, Shop.class);
         LocalDateTime expireTime = redisData.getExpireTime();
-        /*因为 data 声明为 Object，JSON 反序列化时解析器不知道具体目标类型，
+        *//*因为 data 声明为 Object，JSON 反序列化时解析器不知道具体目标类型，
         就默认把它解析成通用的键值对容器 JSONObject（运行时类型）。
         所以取出来后需要手动强转 + 再转一次才能得到真正的 Shop。
         这正是之前讨论过的"为什么不用泛型"的延续——JSON 反序列化会丢失类型信息，
-        无论声明 Object 还是 <T>，取出来都得手动指定类型再转一次。*/
+        无论声明 Object 还是 <T>，取出来都得手动指定类型再转一次。*//*
         //5.判断是否过期
         if (expireTime.isAfter(LocalDateTime.now())){
             //5.1.未过期，直接返回店铺信息
@@ -186,9 +192,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop),CACHE_SHOP_TTL , TimeUnit.MINUTES);
         //7.返回
         return shop;
-    }
+    }*/
 
-    private boolean tryLock(String key){//上互斥锁锁.这里的key是锁的key
+/*    private boolean tryLock(String key){//上互斥锁锁.这里的key是锁的key
         Boolean aBoolean = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.SECONDS);//相当于SETNX
         return BooleanUtil.isTrue(aBoolean);//这里之所以不直接返回，因为Boolean对象可能为空指针
     }
@@ -209,7 +215,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         redisData.setExpireTime(LocalDateTime.now().plusSeconds(expireSeconds));//从当前时间加上expireSeconds时间
         //3.写入Redis
         stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id,JSONUtil.toJsonStr(redisData));
-    }
+    }*/
 
     @Override
     @Transactional//给方法加事务：要么全部成功，要么全部失败，保证数据不出错。任何一步报错 → 全部回滚，像没执行过一样
