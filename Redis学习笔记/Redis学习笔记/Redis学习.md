@@ -4490,3 +4490,352 @@ Voucher 的字段 → JSON 映射
 4. String → "双引号字符串"、Long/Integer → 数字、LocalDateTime → "2026-07-22T10:00:00"
 ```
 
+
+
+
+
+#### 4、实现秒杀下单
+
+下单时需要判断两点：
+
+- 秒杀是否开始或结束，如果尚未开始货已结束则无法下单
+- 库存是否充足，不足则无法下单
+
+![image-20260723140924001](Redis学习.assets/image-20260723140924001.png)
+
+照着这个流程图，开始写代码。秒杀下单的请求入口是 `VoucherOrderController`，所以从 Controller 开始一层层往下改。
+
+**（1）VoucherOrderController —— 接收秒杀请求**
+
+打开 `VoucherOrderController.java`，原本的 `seckillVoucher` 方法是个 TODO 占位：
+
+```java
+@PostMapping("seckill/{id}")
+public Result seckillVoucher(@PathVariable("id") Long voucherId) {
+    return Result.fail("功能未完成");
+}
+```
+
+注入 `IVoucherService`，改为调用 service 层的方法：
+
+```java
+@Resource
+private IVoucherService voucherOrderService;
+
+@PostMapping("seckill/{id}")
+public Result seckillVoucher(@PathVariable("id") Long voucherId) {
+    return voucherOrderService.seckillVoucher(voucherId);
+}
+```
+
+> 💡 这里注入的是 `IVoucherService` 而不是 `IVoucherOrderService`。因为秒杀下单的核心逻辑涉及优惠券查询、库存扣减、订单创建，和优惠券业务强关联，放在 `VoucherServiceImpl` 里更内聚。而且你注意看，虽然变量名叫 `voucherOrderService`，但类型是 `IVoucherService`——变量名只是起的名字，实际注入的是哪个接口的实现才是关键。
+
+`@PathVariable("id")` 从 URL 路径 `/seckill/{id}` 中提取优惠券id，比如请求 `/voucher-order/seckill/10`，`voucherId` 就是 `10`。
+
+**（2）IVoucherService 接口 —— 声明方法**
+
+在 `IVoucherService.java` 里新增 `seckillVoucher` 方法声明：
+
+```java
+Result seckillVoucher(Long voucherId);
+```
+
+**（3）VoucherServiceImpl —— 实现秒杀下单逻辑**
+
+在 `VoucherServiceImpl.java` 里实现具体逻辑，对照流程图一步步来：
+
+```java
+@Resource
+RedisIdWorker redisIdWorker;          // 全局唯一ID生成器
+@Resource
+IVoucherOrderService voucherOrderService;  // 订单服务
+
+@Transactional
+@Override
+public Result seckillVoucher(Long voucherId) {
+    // 1.查询优惠券
+    SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+
+    // 2.判断秒杀是否开始
+    if (voucher.getBeginTime().isAfter(LocalDateTime.now())){
+        return Result.fail("秒杀尚未开始");
+    }
+    // 3.判断秒杀是否已经结束
+    if (voucher.getEndTime().isBefore(LocalDateTime.now())){
+        return Result.fail("秒杀已经结束");
+    }
+    // 4.判断库存是否充足
+    if (voucher.getStock() < 1){
+        return Result.fail("库存不足！");
+    }
+    // 5.扣减库存
+    boolean success = seckillVoucherService.update()
+            .setSql("stock = stock - 1")       // SQL: SET stock = stock - 1
+            .eq("voucher_id", voucherId)        // WHERE voucher_id = ?
+            .update();
+    if (!success){
+        return Result.fail("库存不足");
+    }
+    // 6.创建订单
+    VoucherOrder voucherOrder = new VoucherOrder();
+    // 6.1 订单id —— 用Redis全局唯一ID生成器
+    long orderId = redisIdWorker.nextId("order");
+    voucherOrder.setId(orderId);
+    // 6.2 用户id —— 从ThreadLocal拿当前登录用户
+    Long userId = UserHolder.getUser().getId();
+    voucherOrder.setUserId(userId);
+    // 6.3 代金券id
+    voucherOrder.setVoucherId(voucherId);
+    // 保存订单到数据库
+    voucherOrderService.save(voucherOrder);
+    // 7.返回订单id
+    return Result.ok(orderId);
+}
+```
+
+**几个关键点：**
+
+- **`@Transactional`**：整个秒杀流程（扣库存 + 创建订单）放在一个事务里，库存扣了但订单没生成，或者反过来，都不行。要么都成功，要么都回滚。
+
+- **时间判断用 `isAfter` 和 `isBefore`**：`LocalDateTime` 的两个方法非常直观：
+  - `beginTime.isAfter(now)` → 开始时间在当前时间"之后" → 秒杀还没开始
+  - `endTime.isBefore(now)` → 结束时间在当前时间"之前" → 秒杀已经结束了
+
+- **`setSql("stock = stock - 1")`**：这是 MyBatis-Plus 的一个非常实用的方法，允许在更新语句中写原生 SQL 片段。`stock = stock - 1` 相当于告诉 MySQL：**在当前库存值的基础上减 1**，而不是设置成某个固定值。这样在高并发下，多个线程同时扣库存时，每个线程都是在"当前真实库存"的基础上减 1，不会出现"读到的库存都是 5，大家都 set stock=4"这种覆盖问题。
+
+- **`eq("voucher_id", voucherId)`**：MyBatis-Plus 的条件构造，等价于 `WHERE voucher_id = ?`。`voucher_id` 是 `tb_seckill_voucher` 表的主键，条件唯一，所以更新的就是这一条秒杀券的库存。
+
+- **订单 ID 用 `redisIdWorker.nextId("order")`**：订单号不是 MySQL 自增，而是用上一节写的全局唯一 ID 生成器，保证分布式环境下也不重复。`"order"` 是业务前缀，最终拼成 Redis key `icr:order:2026:07:23`。
+
+- **用户 ID 从 `UserHolder.getUser().getId()` 拿**：`UserHolder` 里的用户信息是拦截器从 Redis 查出来放进 ThreadLocal 的，整个请求链路都能拿到，不用在方法间传来传去。
+
+- **`VoucherOrder` 的 `@TableId(type = IdType.INPUT)`**：注意实体类上主键策略是 `INPUT` 而不是 `AUTO`，意思是**主键由程序自己赋值**，不依赖数据库自增。所以我们用 `redisIdWorker` 生成 id 后手动 set 进去。
+
+- **扣库存的返回值 `success`**：`update()` 返回的是 `boolean`——受影响行数 > 0 返回 `true`，否则 `false`。在超高并发下可能出现这种情况：多个线程同时读到 `stock=1`，都通过了第 4 步的"库存充足"判断，但 `stock = stock - 1` 在执行时发现 stock 已经被别人扣成 0 了（因为 `stock = stock - 1` 是相对扣减，MySQL 行锁保证同一时刻只有一个线程能更新），后面的线程 `update()` 返回 `false`（受影响行数为 0），返回"库存不足"。
+
+------
+
+**常见问题：**
+
+**（1）`setSql("stock = stock - 1")` 和 `set("stock", stock - 1)` 有什么区别？为什么用前者？**
+
+这是一个非常关键的并发安全问题。
+
+**方式一：`set("stock", stock - 1)`（❌ 不安全）**
+
+```java
+SeckillVoucher voucher = seckillVoucherService.getById(voucherId);  // 读到 stock = 5
+seckillVoucherService.update()
+    .set("stock", voucher.getStock() - 1)  // SET stock = 4
+    .eq("voucher_id", voucherId)
+    .update();
+```
+
+生成的 SQL：`UPDATE tb_seckill_voucher SET stock = 4 WHERE voucher_id = ?`
+
+**方式二：`setSql("stock = stock - 1")`（✅ 安全）**
+
+```java
+seckillVoucherService.update()
+    .setSql("stock = stock - 1")  // SET stock = stock - 1
+    .eq("voucher_id", voucherId)
+    .update();
+```
+
+生成的 SQL：`UPDATE tb_seckill_voucher SET stock = stock - 1 WHERE voucher_id = ?`
+
+**并发场景对比：**
+
+假设当前库存 stock = 5，两个线程同时执行：
+
+```
+方式一（❌ 不安全）：                方式二（✅ 安全）：
+
+线程A 读到 stock=5                  线程A 读到 stock=5
+线程B 读到 stock=5                  线程B 读到 stock=5
+线程A SET stock=4  ✅               线程A SET stock = stock-1  → MySQL行锁，stock									变成4
+线程B SET stock=4  ❌ 还是4！       线程B SET stock = stock-1  → MySQL行锁，stock变										成3
+```
+
+| 对比项 | `set("stock", stock-1)` | `setSql("stock = stock - 1")` |
+| --- | --- | --- |
+| SQL | `SET stock = 4`（固定值） | `SET stock = stock - 1`（相对计算） |
+| 计算位置 | **Java 内存**里算好再传 | **MySQL** 执行时计算 |
+| 并发安全 | ❌ 不安全，读到的是"快照值" | ✅ 安全，MySQL行锁保证原子性 |
+| 适用场景 | 非并发、普通更新 | **高并发扣库存、点赞数、计数类** |
+
+核心区别就一句话：**方式一是"在我读到的基础上减"，方式二是"在数据库当前真实值的基础上减"**。高并发下，"我读到的值"可能已经不是"数据库当前真实值"了，所以方式一不安全。
+
+------
+
+**（2）为什么还要判断一次 `!success`？第 4 步不是已经判断过 `stock < 1` 了吗？**
+
+第 4 步的 `stock < 1` 判断是**在 Java 内存里**做的，基于 select 出来的快照值。在超高并发场景下：
+
+```
+线程A                              线程B
+select stock=1                     select stock=1
+判断 stock<1？→ 否，通过           判断 stock<1？→ 否，通过
+UPDATE stock=stock-1 → stock=0    UPDATE stock=stock-1 → 此时stock=0，
+                                  行锁等A释放后执行，stock已经=0，
+                                  再减1会变成-1... 
+```
+
+等等，其实 `stock = stock - 1` 这个 SQL 即使 stock=0 也会正常执行（得到 -1），`update()` 仍然返回 `true`（受影响行数 > 0）。**所以这里 `!success` 判断主要防的是更极端的情况**，比如行不存在（`eq` 条件没匹配到任何行）时返回 `false`。
+
+------
+
+**（3）`voucherOrderService.save(voucherOrder)` 这里存了哪些字段？**
+
+看 `VoucherOrder` 实体类，我们手动 set 了三个字段：
+
+| 字段 | 值 | 来源 |
+| --- | --- | --- |
+| `id` | 全局唯一ID | `redisIdWorker.nextId("order")` |
+| `userId` | 当前用户ID | `UserHolder.getUser().getId()` |
+| `voucherId` | 优惠券ID | 方法参数 `voucherId` |
+
+其他字段（`payType`、`status`、`createTime`、`updateTime` 等）没有手动赋值：
+- `createTime`、`updateTime`：数据库表设了 `DEFAULT CURRENT_TIMESTAMP`，MySQL 自动填充
+- `payType`、`status`：表有默认值，后续支付流程再更新
+
+------
+
+**（4）整个秒杀下单的请求链路是怎样的？**
+
+```
+前端 POST /voucher-order/seckill/10
+  → VoucherOrderController.seckillVoucher(10)
+      → IVoucherService.seckillVoucher(10)
+          → VoucherServiceImpl.seckillVoucher(10)
+              ├── 1. seckillVoucherService.getById(10)      → 查 tb_seckill_voucher
+              ├── 2~4. 校验时间 + 库存
+              ├── 5. seckillVoucherService.update()          → 扣库存（UPDATE tb_seckill_voucher）
+              ├── 6. redisIdWorker.nextId("order")           → 生成全局唯一订单号
+              └── 7. voucherOrderService.save(voucherOrder)  → 插入 tb_voucher_order
+          → 返回 Result.ok(orderId)
+  → 前端拿到订单号
+```
+
+
+
+
+
+#### 5、库存超卖问题分析
+
+在高并发多线程场景下，很容易出现**线程并发的安全问题**。
+
+超卖问题是典型的多线程安全问题，针对这一问题的常见解决方案就是加锁：
+
+- **悲观锁**
+
+认为线程安全问题一定会发生，因此在操作数据之前先获取锁，确保线程串行执行。例如Synchronized、Lock都属于悲观锁
+
+- **乐观锁**
+
+认为线程安全问题不一定会发生，因此不加锁，只是在更新数据时去判断有没有其他线程对数据做了修改。 如果没有修改则认为是安全的，自己才更新数据。 如果已经被其它线程修改说明发生了安全问题，此时可以重试或异常
+
+------
+
+**乐观锁**
+
+乐观锁的关键是判断之前查询得到的数据是否被修改过，常见的方式有两种：
+
+- **版本号法**
+
+![image-20260723152618231](Redis学习.assets/image-20260723152618231.png)
+
+版本号法的核心思想：**给每条数据加一个 `version` 字段，每次修改数据时 `version` 都会 +1，更新时必须带上版本号条件——只有当版本号和自己之前读到的一致时，才允许更新。**
+
+用一个简单例子来理解：
+
+```
+数据库里：stock=100, version=1
+
+线程A                      线程B
+读 stock=100, ver=1        读 stock=100, ver=1
+要扣库存                    要扣库存
+UPDATE SET stock=99,
+        version=version+1   UPDATE SET stock=99,
+WHERE voucher_id=?                 version=version+1
+  AND version=1              WHERE voucher_id=?
+                                AND version=1
+✅ 成功！ver变成2            ❌ 失败！ver已经是2了
+                               （说明有人改过，重试）
+```
+
+线程A先到，`WHERE version=1` 成立，更新成功，version 变成 2。线程B再来，它的 `WHERE version=1` 已经不成立了（version 被 A 改成了 2），更新失败，B 需要重新读取数据再试。
+
+**版本号法的优缺点：**
+
+| 优点 | 缺点 |
+| --- | --- |
+| 实现简单，逻辑清晰 | 需要给表额外加一个 `version` 字段 |
+| 每次更新都能感知到"有没有别人改过" | 高并发下冲突多，大量重试请求可能失败 |
+| 不影响正常读写性能 | 适合写冲突少的场景，不太适合秒杀这种高冲突场景 |
+
+- **CAS法**
+
+![image-20260723152726683](Redis学习.assets/image-20260723152726683.png)
+
+**CAS（Compare And Swap，比较并交换）** 是乐观锁的另一种实现方式，和版本号法的思想一样——"更新前先确认数据有没有被别人改过"，但 CAS 不需要额外的 `version` 字段，而是直接**用数据本身的值作为判断条件**。
+
+在秒杀扣库存的场景里，CAS 的做法是：**更新时把 `stock` 的旧值作为 WHERE 条件**，只有当库存值和自己之前读到的一致时，才扣减。
+
+```
+线程A                              线程B
+读 stock=100                       读 stock=100
+要扣库存                            要扣库存
+UPDATE SET stock=stock-1           UPDATE SET stock=stock-1
+WHERE voucher_id=?                 WHERE voucher_id=?
+  AND stock=100                      AND stock=100
+✅ 成功！stock变成99                ❌ 失败！stock已经不是100了
+```
+
+线程A先把 stock 从 100 改成了 99，线程B的 `WHERE stock=100` 就不成立了，更新失败。
+
+**CAS 和版本号法对比：**
+
+| 对比项 | 版本号法 | CAS法 |
+| --- | --- | --- |
+| 额外字段 | 需要 `version` 列 | **不需要**，直接用业务字段 |
+| 判断条件 | `WHERE version = ?` | `WHERE stock = ?` |
+| 实现成本 | 要加字段、改表结构 | **零成本，改 SQL 即可** |
+| 适用场景 | 通用场景 | 字段本身有"变化"语义时（如计数、库存） |
+
+**所以秒杀场景选 CAS，因为 `stock` 字段天然就是一个"会变化的值"，直接用 `WHERE stock = ?` 就能实现乐观锁，不需要额外字段。**
+
+------
+
+**常见问题：**
+
+**（1）CAS 的 `WHERE stock = ?` 和上一节讲的 `WHERE stock > 0` 有啥区别？**
+
+上一节扣库存的 SQL 是：
+```sql
+UPDATE tb_seckill_voucher SET stock = stock - 1 WHERE voucher_id = ?
+```
+
+没有任何 stock 值判断，只要行存在就扣。结果是高并发下 stock 会变成负数。
+
+CAS 的 SQL 要改成：
+```sql
+UPDATE tb_seckill_voucher SET stock = stock - 1 WHERE voucher_id = ? AND stock = ?
+--                                                                          ↑ CAS条件：stock必须是之前读到的值
+```
+
+加了 `AND stock = ?` 之后，只有"库存值没被别人改过"的线程才能扣成功。但 CAS 也**不能完全解决超卖**——因为判断条件是 `stock = 之前读到的值`，不是 `stock > 0`。即使 stock 没变，从 stock=1 扣到 stock=0 后，下一批线程读到的都是 stock=0，它们在 `WHERE stock=0` 条件下去扣，依然会把 stock 扣成负数。
+
+所以 CAS 只是**降低了并发冲突**，真正要彻底解决超卖，还得用更严格的判断条件（比如 `WHERE stock > 0`），但这在 MyBatis-Plus 的 `update()` 链式调用里没法直接做到，得写自定义 SQL 或用 Redis 的 Lua 脚本。这就是后面要讲的内容。
+
+**（2）悲观锁和乐观锁该怎么选？**
+
+| | 悲观锁 | 乐观锁 |
+| --- | --- | --- |
+| 思路 | 先加锁，再操作 | 先操作，失败再重试 |
+| 实现 | `synchronized` / `Lock` / 数据库行锁 | 版本号 / CAS |
+| 并发性能 | **低**（串行执行，线程排队等锁） | **高**（并发执行，冲突才重试） |
+| 适用场景 | 写冲突多、操作重（不想白干） | 写冲突少、操作轻（重试成本低） |
+| 秒杀场景 | 可用但性能差 | **更推荐**（虽然冲突多，但扣库存操作很轻） |
+
+简单记：**悲观锁 = 先排队再干活，乐观锁 = 先干活，没干成再重来**。秒杀场景扣库存就是个 UPDATE 语句，非常轻量，重试成本很低，所以乐观锁更合适。
