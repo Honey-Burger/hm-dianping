@@ -8,6 +8,10 @@ spring:
     url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=UTC&useUnicode=true&characterEncoding=utf8
     username: root
     password: 123456
+    hikari: # ← 加这几行
+      maximum-pool-size: 50              # 最大连接数，比你的并发高一些
+      minimum-idle: 10                   # 最少保持的空闲连接
+      connection-timeout: 5000           # 等连接的超时时间（毫秒）
   redis:
     host: 127.0.0.1
     port: 6379

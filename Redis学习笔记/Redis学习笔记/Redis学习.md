@@ -4839,3 +4839,288 @@ UPDATE tb_seckill_voucher SET stock = stock - 1 WHERE voucher_id = ? AND stock =
 | 秒杀场景 | 可用但性能差 | **更推荐**（虽然冲突多，但扣库存操作很轻） |
 
 简单记：**悲观锁 = 先排队再干活，乐观锁 = 先干活，没干成再重来**。秒杀场景扣库存就是个 UPDATE 语句，非常轻量，重试成本很低，所以乐观锁更合适。
+
+
+
+
+
+#### 6、乐观锁解决超卖
+
+上一小节详细介绍了CAS法，也就是用库存量代替版本号的方法。
+
+在扣减库存的代码块，添加`.eq("stock", voucher.getStock()`：
+
+```java
+//5.扣减库存
+boolean success = seckillVoucherService.update()// 第一个update：拿工具（构建器），不执行SQL
+        .setSql("stock = stock - 1")// set stock = stock - 1
+        .eq("voucher_id", voucherId).eq("stock", voucher.getStock())
+        //双重判断 where id = ? and stock = ?  , stock 是实现乐观锁的关键
+        .update();// 第二个update：真正执行更新，返回成功与否
+```
+
+随后去JMeter里测试，设置线程两百个，秒杀券库存重新设置一百个。预想异常率应该为50%。
+
+测试结果：
+
+![image-20260724103704317](Redis学习.assets/image-20260724103704317.png)
+
+异常率竟然高达93.5%，这是为什么？
+
+看我们添加的筛选条件`.eq("stock", voucher.getStock()`，这意味线程每次都要保证自己取得的库存数量和实际的库存数量要一致，但如果在两个线程同时并行的情况下，这总情况就很可能会发生问题：
+
+```
+		线程A						线程B
+		  ↓						   |
+	获取库存数量为100				   ↓
+		  |					获取库存数量为100
+		  ↓						   |
+	获取的数量=数据库的库存数量		    |
+		库存-1=99					  ↓
+		   ↓				获取的数量100≠数据库的库存数量99
+		   成功						失败
+```
+
+
+
+为了改善，我们直接把判断条件改为`.gt("stock", 0)//库存大于0即可`，即使拿到的库存信息和实际库存不一致，只要有库存，就可以执行，这样就大大提高了性能。
+
+再重复上述实验，可以得出50的异常。
+
+测试前切记添加请求头
+
+![image-20260724133416941](Redis学习.assets/image-20260724133416941.png)
+
+
+
+#### 7、实现一人一单功能
+
+需求：修改秒杀业务，要求同一个优惠券用户只能下一单。
+
+那这里就限制一人一单，在购买前查询订单表里是否存在这个用户id买过这个订单，如果买过，就不让买了。
+
+```java
+//6.一人一单
+Long userId = UserHolder.getUser().getId();
+//6.1.查询订单
+int count = voucherOrderService.query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+//这里是查询订单表，不是优惠券表
+if (count > 0){
+    return Result.fail("你已经购买过一次了");
+}
+```
+
+这个时候我们再用JMeter进行测试，仍然只有一个用户，200个线程。执行结束......
+
+发现库存竟然卖了不止一份，这是为何？
+
+因为和前一个问题一样——你的"一人一单"也是先查后插，200 个线程同时查、同时过、同时插：
+
+```markdown
+同一个用户 token，200 个并发线程：
+
+时刻 T：线程A → count 查 → 0 → 通过 ✅
+时刻 T：线程B → count 查 → 0 → 通过 ✅（A 还没插进去！）
+时刻 T：线程C → count 查 → 0 → 通过 ✅
+...
+时刻 T+1ms：200 个全部通过 → 全部去扣库存 → 全部创建订单 💀
+
+```
+
+改善方法就是加上悲观锁——但怎么加、加在哪里，经历了一个"三版演进"的过程。下面按老师讲课的顺序，把每个版本的问题和为什么要改成下一版，一步步拆开讲清楚。
+
+**版本一：把 `synchronized` 加在方法上**
+
+最直观的想法——既然"一人一单"的查询和插入不是原子的，那把整个方法锁住不就行了？
+
+```java
+@Transactional
+public synchronized Result creatVoucherOrder(Long voucherId) {
+    // 查订单 → 扣库存 → 创建订单
+}
+```
+
+这样能保证同一时刻只有一个线程在执行这个方法，确实解决了并发问题。但带来了一个新问题：
+
+`synchronized` 加在方法上，默认锁的是 **`this`**（当前实例对象）。由于 Spring 的 Service 默认是**单例**的，全局就一个 `VoucherOrderServiceImpl` 实例，导致**所有用户过来都抢同一把锁**。
+
+```
+用户A 买券1  ─┐
+用户B 买券2  ─┤─ 全部排队等同一把 this 锁 💀
+用户C 买券1  ─┘
+```
+
+用户 A 和用户 B 买的是不同的券、完全互不影响，却因为共用一把锁而被串行化，并发性能极差。这就引出了版本二。
+
+**版本二：把锁粒度缩小到"用户级别"**
+
+既然问题是"所有用户抢同一把锁"，那让**不同用户抢不同的锁**就行了。用 `userId` 作为锁对象：
+
+```java
+@Transactional
+public Result creatVoucherOrder(Long voucherId) {
+    Long userId = UserHolder.getUser().getId();
+    synchronized (userId.toString().intern()) {
+        // 查订单 → 扣库存 → 创建订单
+    }
+}
+```
+
+`synchronized (userId.toString().intern())` 的含义逐层拆解：
+
+- `userId.toString()` — 把 Long 型 userId 转成 String（比如 `1L` → `"1"`）
+- `.intern()` — 保证**值相同的字符串是同一个对象**。JVM 把字符串常量池里的 `"1"` 返回给你，不管有多少个线程，只要 userId 都是 `1`，拿到的就是**同一把锁**；userId 不同，拿到的就是不同的锁
+- `synchronized (...)` — 对这个字符串对象加锁
+
+> ⚠ **为什么不能直接用 `userId`（Long 对象）？** 因为 Long 的缓存范围是 `-128 ~ 127`，超出这个范围的 userId（比如 `1001L`）每次自动装箱都是**新对象**，锁就形同虚设。用 `.intern()` 保证同一个字符串值对应同一个对象，不会有这个问题。
+
+这样一来：
+
+```
+用户A (userId=1) 买券1 → 锁 "1"
+用户B (userId=2) 买券2 → 锁 "2"   ← 和 A 互不影响 ✅
+用户C (userId=1) 买券1 → 锁 "1"   ← 和 A 抢同一把锁（正常，因为同一用户）
+```
+
+锁粒度从"全局"缩小到了"用户级"，不同用户之间不再互相阻塞。
+
+但是版本二还有问题——和事务有关。
+
+**版本三：拆成两个方法 + `AopContext.currentProxy()`**
+
+版本二虽然锁粒度对了，但存在一个致命问题：**`@Transactional` 和 `synchronized` 放在同一个方法上，事务可能没生效**。
+
+这不是 Java 的问题，而是 **Spring 事务的实现机制**导致的。下面展开讲。
+
+---
+
+**Spring 事务是怎么工作的？——代理对象**
+
+Spring 的 `@Transactional` 并不是直接修改你的方法，而是通过 **AOP 代理**来实现的。当你在一个方法上标注 `@Transactional`，Spring 会做这样的事：
+
+```
+你写的类:                              Spring 生成的代理类:
+VoucherOrderServiceImpl              VoucherOrderServiceImpl$$EnhancerBySpringCGLIB
+┌──────────────────────┐             ┌──────────────────────────────┐
+│ creatVoucherOrder() {│             │ creatVoucherOrder() {        │
+│   // 业务代码        │             │   // 1. 开启事务             │
+│ }                    │             │   // 2. 调用真实对象的方法   │
+└──────────────────────┘             │   // 3. 提交/回滚事务        │
+    ↑ 真实对象(target)               │ }                            │
+                                     └──────────────────────────────┘
+                                         ↑ 代理对象，注入给 Controller
+```
+
+Spring 往 IOC 容器里放的并不是你写的 `VoucherOrderServiceImpl` 实例本身，而是**包了一层"壳"的代理对象**。Controller 拿到的是这个代理对象，调用代理对象的方法时，代理会在方法前后织入事务管理代码（开启事务 → 调真实方法 → 提交/回滚）。
+
+**问题就出在"自己调自己"**：
+
+在版本二中，如果 Controller 调的是 `creatVoucherOrder()`，那么流程是这样的：
+
+```
+Controller → 代理对象.creatVoucherOrder()  ← 经过了代理，事务生效 ✅
+                → 真实对象.creatVoucherOrder()  ← 里面直接执行 synchronized 代码块
+```
+
+这个流程事务是生效的。但如果我们把锁放在外层（`seckillVoucher` 方法里），让 `seckillVoucher` 内部调用 `this.creatVoucherOrder()`：
+
+```java
+// seckillVoucher() 里：
+synchronized (userId.toString().intern()) {
+    return this.creatVoucherOrder(voucherId);  // ← this 是真实对象！
+}
+```
+
+`this` 拿到的是真实对象，**跳过代理**，`@Transactional` 的事务增强就不会生效——相当于你绕过了门口的保安，直接推门进了房间。
+
+**解决方案：自己拿到代理对象**
+
+```java
+// seckillVoucher() 里：
+synchronized (userId.toString().intern()) {
+    IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+    return proxy.creatVoucherOrder(voucherId);  // ← 通过代理对象调用，事务生效 ✅
+}
+```
+
+`AopContext.currentProxy()` 是 Spring AOP 提供的方法，它从 **ThreadLocal** 中取出当前线程对应的**代理对象**。因为 Controller 调 `seckillVoucher()` 时走的是代理对象，Spring 在进入代理对象的方法之前就把代理对象塞进了 ThreadLocal，你在被调用的方法内部随时可以用 `currentProxy()` 取出来。
+
+要让这个机制生效，还需要在启动类或配置类上加 `@EnableAspectJAutoProxy(exposeProxy = true)`，`exposeProxy = true` 就是告诉 Spring "把代理对象暴露到 ThreadLocal 里"，默认是 `false`。
+
+> 💡 **口诀**：`this` 是真身（不走代理，事务失效），`proxy` 是假身（走代理，事务生效）。自己调自己要用假身不能用真身。
+
+---
+
+**三版对比总结**
+
+|          | 版本一                         | 版本二                                       | 版本三（最终版）                                         |
+| -------- | ------------------------------ | -------------------------------------------- | -------------------------------------------------------- |
+| **写法** | `synchronized` 在方法上        | `synchronized(userId)` 块 + `@Transactional` | 拆成两个方法，外层加锁 + 内层事务，通过 proxy 调用       |
+| **锁粒度** | 全局一把锁（this）             | 用户级（每个 userId 一把锁）✅               | 用户级（每个 userId 一把锁）✅                           |
+| **并发性** | ❌ 所有用户串行                 | ✅ 不同用户不互相阻塞                        | ✅ 不同用户不互相阻塞                                    |
+| **事务**   | 可能正常（走代理）             | ❌ this 调用导致事务失效                      | ✅ 通过 proxy 调用，事务生效                             |
+| **锁与事务的时序** | 锁释放 → 事务提交（锁在方法结束释放，事务在代理层提交，有间隙） | 同左 | ✅ 锁包裹 proxy 调用，proxy 返回前事务已提交，锁释放时事务一定已完成 |
+
+**为什么最终版（版本三）的时序是正确的？**
+
+```
+seckillVoucher()                        creatVoucherOrder() [在代理层]
+  │                                        │
+  ├─ 查券、判时间、判库存                   │
+  ├─ synchronized(userId) { ──────────────► │
+  │    获取 proxy                           ├─ 开启事务
+  │    proxy.creatVoucherOrder(id) ────────►├─ 查订单
+  │                                         ├─ 扣库存
+  │                                         ├─ 创建订单
+  │                                         ├─ 提交事务 ✅
+  │   ◄─────────────────────────────────────┤
+  │ } ← 事务提交后，锁才释放                 │
+```
+
+核心要点：**锁包裹了 proxy 的整个调用过程**，而 proxy 的方法在返回前就已经提交了事务。所以锁释放时，事务一定已经提交完成——不会出现"锁释放了但事务还没提交，另一个线程进来读到旧数据"的问题。
+
+---
+
+常见问题：
+
+- **真对象和代理对象是什么？**
+
+  真对象（Target Object）就是你写的 `VoucherOrderServiceImpl` 实例本身，包含了核心业务逻辑。代理对象（Proxy Object）是 Spring 用 CGLIB 动态生成的一个**子类对象**，它包装了真对象，在调用真对象的方法前后织入额外的逻辑（事务、日志、权限、缓存等）。
+
+  用类比理解：真对象是演员（负责演戏），代理对象是经纪公司（负责安排通告、谈合同、收钱），外部找演员都是通过经纪公司，经纪公司在演员上场前下场后处理杂事。
+
+  在项目里，被注入到 Controller 里的永远是代理对象，不是真对象。你用 `System.out.println(voucherOrderService.getClass().getName())` 打印，会看到类似 `com.hmdp.service.impl.VoucherOrderServiceImpl$$EnhancerBySpringCGLIB$$xxxxx` 的名字——`$$` 是 CGLIB 的标志，说明这是个代理。
+
+- **为什么非要用 `@Transactional`？**
+
+  秒杀下单涉及两步写操作：**扣库存**（UPDATE `tb_seckill_voucher`）和**创建订单**（INSERT `tb_voucher_order`），这两步必须"同生共死"——要么都成功，要么都失败。
+
+  如果不用事务：
+  - 扣库存成功了，但创建订单时断电/抛异常 → 库存被扣了但用户没拿到订单 💀
+  - 创建订单成功了，但扣库存时因为乐观锁竞争失败了（没判断返回值）→ 用户有订单但库存没扣 💀
+
+  `@Transactional` 保证这两个操作在一个数据库事务里，任何一步失败都会全部回滚，保证数据一致性。
+
+- **`synchronized (userId.toString().intern())` 是干嘛的？**
+
+  这是 Java 的同步代码块，用于保证**同一个用户的请求串行执行**。
+
+  作用是：拿到当前用户 ID，转成字符串并手工放入字符串常量池（`.intern()`），然后用这个字符串对象作为"互斥锁"——同一个 userId 的所有线程必须排队等锁，不同 userId 的线程用的是不同的锁，互不阻塞。
+
+  为什么要加这个？因为"一人一单"的逻辑是"先查后插"（先查有没有订单，没有才创建），这一步本身不是原子的。200 个并发请求同时查 → 都发现没买过 → 都去创建订单，一人一单就形同虚设。加上同步锁后变成：查订单 + 创建订单这整段代码，同一时刻只有一个线程能执行，其他线程排队等待——第一个线程创建完订单后，后续线程再查就会发现"你已经买过"了。
+
+- **`synchronized` 块写在 `seckillVoucher()` 里，和写在 `creatVoucherOrder()` 方法前面加 `synchronized` 有什么区别？**
+
+  区别有两个，一个关于**锁粒度**，一个关于**锁与事务的时序**。
+
+  **① 锁粒度不同**
+
+  写在 `creatVoucherOrder()` 方法上（`public synchronized Result creatVoucherOrder(...)`）：锁的是 `this` 对象，全局所有用户共用一把锁 → 用户 A 和用户 B 买不同的券也要互相排队。
+
+  写在 `seckillVoucher()` 里的 `synchronized (userId.toString().intern())`：锁的是用户 ID 字符串，不同用户用不同的锁 → 只有同一个用户自己的并发请求才排队，不同用户之间完全并发。
+
+  **② 锁和事务的时序不同**
+
+  如果 `synchronized` 写在 `creatVoucherOrder()` 方法上，方法执行完锁就释放了，但事务要等代理对象的方法返回后才提交——锁释放的瞬间，另一个线程就能进入，而此时上一个线程的事务还没提交完，导致"一人一单"的查询可能读到旧数据。
+
+  现在的写法，`synchronized` 包裹 `proxy.creatVoucherOrder()` 的**整个调用过程**，锁内的事务一定在锁释放前提交——保证下一个拿到锁的线程一定能看到上一个线程提交的最新数据。
